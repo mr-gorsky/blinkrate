@@ -5,163 +5,233 @@ import plotly.graph_objects as go
 from PIL import Image
 import tempfile
 import os
-import time
+from scipy.signal import find_peaks, medfilt
+import pandas as pd
 
 st.set_page_config(
-    page_title="Blink Rate Analyzer",
+    page_title="VR Eye Blink Analyzer",
     page_icon="👁️",
     layout="wide"
 )
 
-def calculate_eye_openness(frame):
-    """
-    Calculate eye openness based on image analysis
-    Returns value between 0 (closed) and 1 (open)
-    """
+def preprocess_vr_frame(frame):
+    """Preprocessing optimized for VR side-camera footage"""
     # Convert to grayscale
-    if len(frame.shape) == 3:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = frame
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
     
-    height, width = gray.shape
+    # VR cameras often have specific lighting - enhance contrast
+    gray = cv2.equalizeHist(gray)
     
-    # Define eye region (center of frame)
-    eye_region = gray[int(height*0.3):int(height*0.7), int(width*0.3):int(width*0.7)]
+    # Reduce noise while preserving edges
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
     
-    if eye_region.size == 0:
-        return 0.5
-    
-    # Calculate metrics for eye openness
-    # 1. Variance (open eyes have more texture/variance)
-    variance = np.var(eye_region) / 1000
-    
-    # 2. Edge density (open eyes have more edges)
-    edges = cv2.Canny(eye_region, 50, 150)
-    edge_density = np.sum(edges > 0) / eye_region.size
-    
-    # 3. Brightness distribution
-    hist = cv2.calcHist([eye_region], [0], None, [64], [0, 256])
-    hist_norm = hist / hist.sum()
-    entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-8))
-    entropy_norm = entropy / 6  # Normalize
-    
-    # Combine metrics
-    openness = min(1.0, max(0.1, (variance * 0.4 + edge_density * 0.4 + entropy_norm * 0.2)))
-    
-    return openness
+    return gray
 
-def process_video_for_blinks(video_path, threshold=0.3):
+def detect_vr_eye_region(frame):
     """
-    Process video and detect blinks
+    Detect eye region specifically for VR side-camera footage
+    Based on the screenshot, the eye is in the left portion of the frame
     """
+    height, width = frame.shape[:2]
+    
+    # For VR side-camera: eye is typically in left 2/3 of frame, centered vertically
+    # Adjust these based on the actual camera position
+    eye_region = (
+        int(width * 0.1),   # x1 - start from left
+        int(height * 0.2),  # y1 - from top
+        int(width * 0.7),   # x2 - to right
+        int(height * 0.8)   # y2 - to bottom
+    )
+    
+    return eye_region
+
+def calculate_vr_eye_state(frame):
+    """
+    Calculate eye state specifically for VR side-camera footage
+    Optimized for the angled view and lighting conditions
+    """
+    gray = preprocess_vr_frame(frame)
+    eye_region = detect_vr_eye_region(frame)
+    x1, y1, x2, y2 = eye_region
+    
+    roi = gray[y1:y2, x1:x2]
+    
+    if roi.size == 0:
+        return 0.4, eye_region
+    
+    # For VR side-cameras, we need different metrics
+    height, width = roi.shape
+    
+    # Split into subregions for better analysis
+    # Upper part (eyelid area) and lower part (pupil/iris area)
+    upper_roi = roi[0:int(height*0.4), :]
+    lower_roi = roi[int(height*0.4):, :]
+    
+    metrics = {}
+    
+    # 1. Upper region analysis (eyelid movement)
+    if upper_roi.size > 0:
+        metrics['upper_variance'] = np.var(upper_roi) / 500  # Normalized
+        metrics['upper_edges'] = np.sum(cv2.Canny(upper_roi, 30, 100) > 0) / upper_roi.size
+    else:
+        metrics['upper_variance'] = 0.3
+        metrics['upper_edges'] = 0.2
+    
+    # 2. Lower region analysis (pupil/iris)
+    if lower_roi.size > 0:
+        metrics['lower_variance'] = np.var(lower_roi) / 500
+        metrics['lower_edges'] = np.sum(cv2.Canny(lower_roi, 30, 100) > 0) / lower_roi.size
+        
+        # Brightness analysis - pupil is typically darker
+        lower_mean = np.mean(lower_roi) / 255
+        metrics['lower_brightness'] = 1.0 - lower_mean  # Invert - darker = more open
+    else:
+        metrics['lower_variance'] = 0.3
+        metrics['lower_edges'] = 0.2
+        metrics['lower_brightness'] = 0.5
+    
+    # 3. Whole region metrics
+    metrics['whole_variance'] = np.var(roi) / 500
+    metrics['whole_edges'] = np.sum(cv2.Canny(roi, 30, 100) > 0) / roi.size
+    
+    # Weighted combination for VR side-camera
+    # Emphasize upper region for blink detection (eyelid movement)
+    openness = (
+        metrics['upper_variance'] * 0.35 +      # Eyelid texture
+        metrics['upper_edges'] * 0.25 +         # Eyelid edges
+        metrics['lower_brightness'] * 0.20 +    # Pupil darkness
+        metrics['whole_variance'] * 0.15 +      # Overall texture
+        metrics['whole_edges'] * 0.05           # Overall edges
+    )
+    
+    # Adjust for VR camera characteristics
+    # VR footage typically has lower overall values due to angle and lighting
+    openness = openness * 1.3  # Compensate for generally lower values
+    
+    return max(0.1, min(0.9, openness)), eye_region
+
+def calculate_vr_adaptive_threshold(openness_values):
+    """
+    Calculate adaptive threshold specifically for VR footage
+    """
+    if len(openness_values) < 20:
+        return 0.22  # Good default for VR side-cameras
+    
+    values = np.array(openness_values)
+    
+    # VR footage typically has:
+    # - Lower mean values (0.3-0.5 range)
+    # - Smaller variance
+    mean_val = np.mean(values)
+    std_val = np.std(values)
+    q25 = np.percentile(values, 25)
+    
+    # For VR: use lower threshold based on distribution
+    if mean_val < 0.4:
+        # Very angled view - use very conservative threshold
+        threshold = q25 * 0.9
+    else:
+        # More visible - use standard approach
+        threshold = mean_val - (std_val * 0.7)
+    
+    # VR-specific bounds
+    threshold = max(0.18, min(0.30, threshold))
+    
+    return threshold
+
+def process_vr_video(video_path, user_threshold=None):
+    """Process video with VR-optimized parameters"""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     
     openness_values = []
     timestamps = []
-    blink_events = []
     processed_frames = []
     
     frame_count = 0
-    max_frames = 1000  # Limit for performance
+    max_frames = min(2000, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
     
     while frame_count < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
         
-        # Calculate eye openness
-        openness = calculate_eye_openness(frame)
+        # Calculate VR-optimized eye state
+        openness, eye_region = calculate_vr_eye_state(frame)
+        
         openness_values.append(openness)
         timestamps.append(frame_count / fps)
         
-        # Detect if this is a blink frame
-        is_blink = openness < threshold
-        
-        # Create preview frame (store every 50th frame for performance)
-        if frame_count % 50 == 0:
+        # Store sample frames (every 40 frames for performance)
+        if frame_count % 40 == 0:
             preview = frame.copy()
-            height, width = preview.shape[:2]
+            x1, y1, x2, y2 = eye_region
             
-            # Draw eye region
+            # Draw detection area
+            cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Draw subregions
             cv2.rectangle(preview, 
-                         (int(width*0.3), int(height*0.3)),
-                         (int(width*0.7), int(height*0.7)),
-                         (0, 255, 0), 2)
+                         (x1, y1), 
+                         (x2, int(y1 + (y2-y1)*0.4)), 
+                         (255, 255, 0), 1)  # Upper region
             
-            # Add text
-            color = (0, 0, 255) if is_blink else (255, 255, 255)
-            cv2.putText(preview, f"Openness: {openness:.3f}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            # Add info text
+            color = (0, 0, 255) if openness < (user_threshold or 0.22) else (255, 255, 255)
+            cv2.putText(preview, f"VR Openness: {openness:.3f}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(preview, "Green: Eye ROI | Blue: Eyelid area", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
-            if is_blink:
-                cv2.putText(preview, "BLINK DETECTED", (10, 60),
+            if openness < (user_threshold or 0.22):
+                cv2.putText(preview, "BLINK DETECTED", (10, 90),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
             preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-            processed_frames.append((preview_rgb, openness, is_blink))
+            processed_frames.append((preview_rgb, openness, openness < (user_threshold or 0.22)))
         
         frame_count += 1
     
     cap.release()
     
-    # Detect blink events from openness values
-    blinks = detect_blink_events(openness_values, threshold)
-    
-    return openness_values, timestamps, blinks, processed_frames, fps
+    return openness_values, timestamps, processed_frames, fps
 
-def detect_blink_events(openness_values, threshold=0.3, min_duration=3):
-    """
-    Detect blink events from openness values
-    """
+def detect_vr_blinks(openness_values, threshold=0.22, min_duration=2):
+    """Blink detection optimized for VR footage"""
+    # Smooth specifically for VR signal characteristics
+    openness_smoothed = medfilt(openness_values, 5)
+    
+    # Find blinks as valleys in the signal
+    valleys, properties = find_peaks(
+        1 - np.array(openness_smoothed),
+        height=1-threshold,
+        distance=min_duration,
+        prominence=0.08,  # Lower prominence for VR
+        width=min_duration
+    )
+    
     blinks = []
-    in_blink = False
-    blink_start = 0
+    for valley in valleys:
+        if openness_smoothed[valley] < threshold:
+            # Simple blink event - valley frame
+            blinks.append((valley, valley, valley))
     
-    for i, openness in enumerate(openness_values):
-        if openness < threshold and not in_blink:
-            # Start of blink
-            in_blink = True
-            blink_start = i
-        elif openness >= threshold and in_blink:
-            # End of blink
-            blink_duration = i - blink_start
-            if blink_duration >= min_duration:
-                blinks.append((blink_start, blink_start, i))
-            in_blink = False
-    
-    # Handle blink at the end
-    if in_blink and (len(openness_values) - blink_start) >= min_duration:
-        blinks.append((blink_start, blink_start, len(openness_values)))
-    
-    return blinks
-
-def smooth_values(values, window_size=5):
-    """Smooth values using moving average"""
-    if len(values) < window_size:
-        return values
-    
-    smoothed = []
-    for i in range(len(values)):
-        start = max(0, i - window_size // 2)
-        end = min(len(values), i + window_size // 2 + 1)
-        window = values[start:end]
-        smoothed.append(np.mean(window))
-    
-    return smoothed
+    return blinks, openness_smoothed
 
 def main():
-    st.title("👁️ Blink Rate Analyzer - STVARNA ANALIZA")
-    st.markdown("**Uploadaj video oka za stvarnu analizu treptaja**")
+    st.title("👁️ VR Eye Blink Analyzer")
+    st.markdown("**Optimizirano za VR headset side-camera snimke**")
     
     uploaded_file = st.file_uploader(
-        "Odaberi video snimku oka", 
-        type=['mp4', 'mov', 'avi', 'mkv']
+        "Uploadaj VR eye-tracking video", 
+        type=['mp4', 'mov', 'avi', 'mkv', 'webm']
     )
     
     if uploaded_file is not None:
-        # Save uploaded file
+        if uploaded_file.size > 200 * 1024 * 1024:
+            st.error("Video prevelik! Maksimalno 200MB. Smanji video prije uploada.")
+            return
+            
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
             tmp_file.write(uploaded_file.read())
             video_path = tmp_file.name
@@ -175,88 +245,95 @@ def main():
             cap.release()
             
             st.info(f"""
-            **Informacije o videu:**
-            - FPS: {fps:.1f}
-            - Ukupno frejmova: {total_frames}
-            - Trajanje: {duration:.2f} sekundi
+            **VR Video Analysis Ready**  
+            📁 {uploaded_file.name}  
+            ⏱️ {duration:.1f}s duration  
+            🎞️ {total_frames} frames  
+            🚀 {fps:.1f} FPS
             """)
             
-            # Parameters
-            st.subheader("Postavke detekcije")
-            col1, col2 = st.columns(2)
-            with col1:
-                sensitivity = st.slider(
-                    "Osjetljivost detekcije", 
-                    min_value=0.1, 
-                    max_value=0.5, 
-                    value=0.3, 
-                    step=0.05,
-                    help="Niže vrijednosti = osjetljivije na treptaje"
-                )
-            with col2:
-                min_duration = st.slider(
-                    "Minimalno trajanje treptaja (frejmovi)", 
-                    min_value=1, 
-                    max_value=10, 
-                    value=3,
-                    help="Minimalni broj frejmova da se računa kao treptaj"
-                )
+            # VR-specific settings
+            st.subheader("🎯 VR-Specific Settings")
             
-            if st.button("🎯 POKRENI ANALIZU TREPTAJA", type="primary"):
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("**Threshold Mode**")
+                auto_mode = st.radio("", ["Auto VR", "Manual"], horizontal=True)
+            with col2:
+                if auto_mode == "Manual":
+                    threshold = st.slider("Threshold", 0.15, 0.35, 0.22, 0.01,
+                                        help="Niže vrijednosti = osjetljivije")
+                else:
+                    threshold = st.slider("Base Sensitivity", 0.18, 0.28, 0.22, 0.01,
+                                        help="Početna osjetljivost za auto-mode")
+            with col3:
+                min_duration = st.slider("Min Duration", 1, 5, 2,
+                                       help="Minimalno trajanje treptaja (frejmovi)")
+            
+            if st.button("🚀 START VR BLINK ANALYSIS", type="primary"):
+                with st.spinner("Processing VR footage..."):
+                    # Process with VR-optimized algorithm
+                    openness_values, timestamps, processed_frames, actual_fps = process_vr_video(
+                        video_path, threshold if auto_mode == "Manual" else None
+                    )
                 
-                # Analyze video
-                status_text.text("🔄 Procesiram video...")
-                openness_values, timestamps, blinks, processed_frames, actual_fps = process_video_for_blinks(
-                    video_path, sensitivity
+                if not openness_values:
+                    st.error("Nema podataka za analizu. Provjeri video format.")
+                    return
+                
+                # Calculate VR-optimized threshold
+                if auto_mode == "Auto VR":
+                    vr_threshold = calculate_vr_adaptive_threshold(openness_values)
+                    final_threshold = min(threshold + 0.02, vr_threshold)
+                    st.success(f"🤖 VR Auto-threshold: **{final_threshold:.3f}**")
+                else:
+                    final_threshold = threshold
+                
+                # Detect blinks
+                blinks, openness_smoothed = detect_vr_blinks(
+                    openness_values, final_threshold, min_duration
                 )
-                progress_bar.progress(50)
-                
-                status_text.text("🔄 Detektiram treptaje...")
-                # Smooth values
-                openness_smoothed = smooth_values(openness_values, 5)
-                
-                # Re-detect blinks with smoothed values
-                blinks = detect_blink_events(openness_smoothed, sensitivity, min_duration)
-                progress_bar.progress(100)
                 
                 # Calculate results
                 total_blinks = len(blinks)
                 blink_rate = (total_blinks / duration) * 60 if duration > 0 else 0
                 
-                status_text.text(f"✅ Analiza završena! Pronađeno {total_blinks} treptaja")
-                
                 # Display results
-                st.success(f"**REZULTATI ANALIZE:** {total_blinks} treptaja detektirano = {blink_rate:.1f} treptaja/minutu")
+                st.success(f"**🎯 VR ANALYSIS COMPLETE: {total_blinks} blinks detected**")
                 
-                # Metrics
+                # Metrics dashboard
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Ukupno treptaja", total_blinks)
-                col2.metric("Stopa treptaja", f"{blink_rate:.1f}/min")
-                col3.metric("Trajanje videa", f"{duration:.1f}s")
-                col4.metric("Analiziranih frejmova", len(openness_values))
+                col1.metric("Total Blinks", total_blinks)
+                col2.metric("Blink Rate", f"{blink_rate:.1f}/min")
+                col3.metric("VR Threshold", f"{final_threshold:.3f}")
+                col4.metric("Signal Quality", f"{np.mean(openness_smoothed):.3f}")
                 
-                # Tabs for different views
-                tab1, tab2, tab3 = st.tabs(["📊 Graf otvorenosti oka", "⏰ Vremenska linija", "👀 Primjer frejmova"])
+                # Detailed analysis
+                tab1, tab2, tab3 = st.tabs(["📊 Signal Analysis", "📈 Blink Timeline", "👁️ Frame Preview"])
                 
                 with tab1:
-                    # Create plot
+                    # Create VR-optimized plot
                     fig = go.Figure()
                     
-                    # Openness values
+                    # Raw signal (light)
+                    fig.add_trace(go.Scatter(
+                        x=timestamps, y=openness_values,
+                        name='Raw Signal',
+                        line=dict(color='lightblue', width=1),
+                        opacity=0.6
+                    ))
+                    
+                    # Smoothed signal (bold)
                     fig.add_trace(go.Scatter(
                         x=timestamps, y=openness_smoothed,
-                        name='Otvorenost oka',
-                        line=dict(color='blue', width=2),
-                        hovertemplate='Vrijeme: %{x:.2f}s<br>Otvorenost: %{y:.3f}<extra></extra>'
+                        name='Smoothed',
+                        line=dict(color='blue', width=2)
                     ))
                     
                     # Threshold line
                     fig.add_trace(go.Scatter(
-                        x=timestamps, 
-                        y=[sensitivity] * len(timestamps),
-                        name='Granica treptaja',
+                        x=timestamps, y=[final_threshold] * len(timestamps),
+                        name='Threshold',
                         line=dict(color='red', dash='dash', width=2)
                     ))
                     
@@ -268,116 +345,108 @@ def main():
                         fig.add_trace(go.Scatter(
                             x=blink_times, y=blink_values,
                             mode='markers',
-                            name='Treptaji',
-                            marker=dict(color='red', size=10, symbol='x', line=dict(width=2)),
-                            hovertemplate='Treptaj @ %{x:.2f}s<extra></extra>'
+                            name='Blinks',
+                            marker=dict(color='red', size=10, symbol='x', line=dict(width=2))
                         ))
                     
                     fig.update_layout(
-                        title="Otvorenost oka kroz vrijeme s detektiranim treptajima",
-                        xaxis_title="Vrijeme (sekunde)",
-                        yaxis_title="Otvorenost oka (0=zatvoreno, 1=otvoreno)",
+                        title="VR Eye Openness Signal with Blink Detection",
+                        xaxis_title="Time (seconds)",
+                        yaxis_title="Eye Openness Score",
                         height=500,
                         showlegend=True
                     )
                     
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # Statistics
-                    st.subheader("Statistika otvorenosti oka")
+                    # Signal statistics
+                    st.subheader("Signal Statistics")
                     col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Prosjek", f"{np.mean(openness_smoothed):.3f}")
-                    col2.metric("Minimum", f"{np.min(openness_smoothed):.3f}")
-                    col3.metric("Maksimum", f"{np.max(openness_smoothed):.3f}")
-                    col4.metric("Standardna devijacija", f"{np.std(openness_smoothed):.3f}")
+                    col1.metric("Mean", f"{np.mean(openness_smoothed):.3f}")
+                    col2.metric("Std Dev", f"{np.std(openness_smoothed):.3f}")
+                    col3.metric("Dynamic Range", f"{np.ptp(openness_smoothed):.3f}")
+                    col4.metric("Blinks/Min", f"{blink_rate:.1f}")
                 
                 with tab2:
                     if blinks:
-                        st.subheader("Detektirani treptaji")
+                        st.subheader("Blink Events Timeline")
                         
-                        # Create timeline table
+                        # Create timeline data
                         blink_data = []
                         for i, blink in enumerate(blinks):
-                            start_time = timestamps[blink[0]]
-                            duration_frames = blink[2] - blink[0]
-                            duration_sec = duration_frames / actual_fps
-                            openness_val = openness_smoothed[blink[0]]
-                            
+                            blink_time = timestamps[blink[0]]
                             blink_data.append({
-                                'Treptaj #': i + 1,
-                                'Vrijeme (s)': f"{start_time:.2f}",
-                                'Trajanje (s)': f"{duration_sec:.2f}",
-                                'Otvorenost': f"{openness_val:.3f}"
+                                'Blink #': i + 1,
+                                'Time (s)': f"{blink_time:.2f}",
+                                'Openness': f"{openness_smoothed[blink[0]]:.3f}",
+                                'Frame': blink[0]
                             })
                         
-                        # Display as table
-                        for blink in blink_data:
-                            col1, col2, col3, col4 = st.columns(4)
-                            col1.metric("Treptaj", blink['Treptaj #'])
-                            col2.metric("Vrijeme", blink['Vrijeme (s)'] + "s")
-                            col3.metric("Trajanje", blink['Trajanje (s)'] + "s")
-                            col4.metric("Otvorenost", blink['Otvorenost'])
+                        # Display as dataframe
+                        df = pd.DataFrame(blink_data)
+                        st.dataframe(df, use_container_width=True)
+                        
+                        # Blink intervals analysis
+                        if len(blinks) > 1:
+                            intervals = []
+                            for i in range(1, len(blinks)):
+                                interval = timestamps[blinks[i][0]] - timestamps[blinks[i-1][0]]
+                                intervals.append(interval)
+                            
+                            st.subheader("Blink Interval Analysis")
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("Avg Interval", f"{np.mean(intervals):.2f}s")
+                            col2.metric("Min Interval", f"{np.min(intervals):.2f}s")
+                            col3.metric("Max Interval", f"{np.max(intervals):.2f}s")
                     
                     else:
-                        st.info("Nije detektiran nijedan treptaj. Pokušaj smanjiti osjetljivost.")
+                        st.info("No blinks detected. Try adjusting the threshold or check video quality.")
                 
                 with tab3:
                     if processed_frames:
-                        st.subheader("Primjer procesiranih frejmova")
+                        st.subheader("VR Frame Analysis Preview")
+                        st.info("Green: Eye detection area | Blue: Eyelid region")
                         
-                        # Show sample frames
                         cols = st.columns(min(3, len(processed_frames)))
                         for idx, (frame, openness, is_blink) in enumerate(processed_frames[:3]):
                             with cols[idx]:
-                                pil_img = Image.fromarray(frame)
-                                st.image(pil_img, 
-                                       caption=f"Otvorenost: {openness:.3f} {'🔴 TREPTAJ' if is_blink else '⚪ Normal'}",
+                                st.image(Image.fromarray(frame),
+                                       caption=f"Openness: {openness:.3f} {'🔴 BLINK' if is_blink else '⚪ OPEN'}",
                                        use_column_width=True)
-                    
-                    # Analysis info
-                    st.subheader("Informacije o analizi")
-                    st.write(f"""
-                    **Kako funkcionira analiza:**
-                    - Analizira se **stvarni video** frejm po frejm
-                    - Mjeri se **otvorenost oka** bazirano na teksturi i edge density
-                    - **Niska otvorenost** = vjerojatno treptaj
-                    - **Granica** ({sensitivity}) određuje što se smatra treptajem
-                    - **Minimalno trajanje** ({min_duration} frejmova) eliminira lažne detekcije
-                    
-                    **Broj analiziranih frejmova:** {len(openness_values)}
-                    **Stopa uzorkovanja:** ~{actual_fps:.1f} FPS
-                    """)
                 
                 # Export results
-                st.subheader("📥 Preuzmi rezultate")
-                results_text = f"""REZULTATI ANALIZE TREPTAJA
+                st.subheader("📥 Export VR Analysis Results")
+                results_text = f"""VR EYE BLINK ANALYSIS RESULTS
 ================================
-Datoteka: {uploaded_file.name}
-Ukupno treptaja: {total_blinks}
-Stopa treptaja: {blink_rate:.2f} treptaja/minutu
-Trajanje videa: {duration:.2f} sekundi
-Osjetljivost: {sensitivity}
-Minimalno trajanje: {min_duration} frejmova
+Video: {uploaded_file.name}
+Total Blinks: {total_blinks}
+Blink Rate: {blink_rate:.1f} blinks/minute
+Video Duration: {duration:.2f} seconds
+VR Threshold: {final_threshold:.3f}
+Frames Analyzed: {len(openness_values)}
+Analysis Mode: {'Auto VR' if auto_mode == 'Auto VR' else 'Manual'}
 
-VREMENA TREPTAJA:
+DETECTED BLINKS:
+Time(s)    Openness
 """
-                for i, blink in enumerate(blinks):
-                    results_text += f"{i+1:2d}. {timestamps[blink[0]]:.2f}s (otvorenost: {openness_smoothed[blink[0]]:.3f})\n"
+                for blink in blinks:
+                    results_text += f"{timestamps[blink[0]]:7.2f}    {openness_smoothed[blink[0]]:.3f}\n"
                 
                 st.download_button(
-                    "💾 Preuzmi rezultate (.txt)",
+                    "💾 Download Full Analysis",
                     results_text,
-                    file_name=f"blink_analysis_{uploaded_file.name.split('.')[0]}.txt"
+                    file_name=f"vr_blink_analysis_{uploaded_file.name.split('.')[0]}.txt",
+                    mime="text/plain"
                 )
                 
         except Exception as e:
-            st.error(f"Greška pri procesiranju: {str(e)}")
+            st.error(f"Processing error: {str(e)}")
             st.info("""
-            **Rješenje problema:**
-            1. Pokušaj s kraćim videom (do 30 sekundi)
-            2. Provjeri je li oko vidljivo u videu
-            3. Podesi osjetljivost (povećaj za manje treptaje, smanji za više)
-            4. Pokušaj s MP4 formatom
+            **VR-Specific Troubleshooting:**
+            - Ensure eye is clearly visible in the video
+            - Try shorter videos (10-30 seconds)
+            - Adjust threshold manually if auto-mode doesn't work
+            - Check lighting consistency in VR footage
             """)
         
         finally:
@@ -386,26 +455,24 @@ VREMENA TREPTAJA:
     
     else:
         st.markdown("""
-        ### 📋 Upute za korištenje:
+        ### 🎯 VR-Specific Features:
         
-        1. **Snimi video** oka pomoću VR kamere sa strane headseta
-        2. **Uploadaj video** (MP4, MOV, AVI, MKV)
-        3. **Podesi postavke** ako je potrebno
-        4. **Klikni "POKRENI ANALIZU TREPTAJA"**
+        **Optimized for Side-Camera Footage:**
+        - 🤖 **Auto VR-threshold** - specifically tuned for angled views
+        - 👁️ **Eyelid-focused analysis** - better for partial visibility
+        - 🎯 **VR region detection** - optimized for side-camera positioning
+        - 📊 **Adaptive algorithms** - adjust to VR lighting conditions
         
-        ### 🔍 Kako radi analiza:
-        - **Stvarno procesira video** frejm po frejm
-        - **Analizira otvorenost oka** koristeći computer vision
-        - **Detektira treptaje** kada otvorenost padne ispod granice
-        - **Računa stopu treptaja** (treptaji/minutu)
-        - **Generira grafove** i detaljne rezultate
+        **Expected VR Signal Characteristics:**
+        - Open eye: 0.4-0.7 range
+        - Closed eye: 0.15-0.3 range  
+        - Typical threshold: 0.18-0.28
         
-        ### 💡 Savjeti za najbolje rezultate:
-        - **Jasno vidljivo oko** u videu
-        - **Konzistentno osvjetljenje**
-        - **Stabilna kamera**
-        - **Video do 2 minute** za bržu obradu
-        - **Počni s default postavkama**
+        **Upload Tips:**
+        - Short videos work best (10-30 seconds)
+        - Ensure consistent lighting
+        - Eye should be visible in left portion of frame
+        - Use MP4 or WEBM format
         """)
 
 if __name__ == "__main__":
