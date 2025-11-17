@@ -5,7 +5,6 @@ import plotly.graph_objects as go
 from PIL import Image
 import tempfile
 import os
-from scipy.signal import find_peaks, medfilt
 import pandas as pd
 
 st.set_page_config(
@@ -13,6 +12,40 @@ st.set_page_config(
     page_icon="👁️",
     layout="wide"
 )
+
+def moving_median_filter(signal, window_size=5):
+    """Simple median filter implementation without scipy"""
+    if len(signal) < window_size:
+        return signal
+    
+    padded = np.pad(signal, (window_size//2, window_size//2), mode='edge')
+    smoothed = []
+    
+    for i in range(len(signal)):
+        window = padded[i:i + window_size]
+        smoothed.append(np.median(window))
+    
+    return np.array(smoothed)
+
+def find_peaks_simple(signal, height=None, distance=None, prominence=None):
+    """Simple peak detection without scipy"""
+    peaks = []
+    
+    for i in range(1, len(signal) - 1):
+        # Check if this is a peak
+        if signal[i] > signal[i-1] and signal[i] > signal[i+1]:
+            # Check height condition
+            if height is not None and signal[i] < height:
+                continue
+            
+            # Check distance condition
+            if distance is not None and peaks:
+                if i - peaks[-1] < distance:
+                    continue
+            
+            peaks.append(i)
+    
+    return np.array(peaks)
 
 def preprocess_vr_frame(frame):
     """Preprocessing optimized for VR side-camera footage"""
@@ -35,7 +68,6 @@ def detect_vr_eye_region(frame):
     height, width = frame.shape[:2]
     
     # For VR side-camera: eye is typically in left 2/3 of frame, centered vertically
-    # Adjust these based on the actual camera position
     eye_region = (
         int(width * 0.1),   # x1 - start from left
         int(height * 0.2),  # y1 - from top
@@ -63,15 +95,14 @@ def calculate_vr_eye_state(frame):
     height, width = roi.shape
     
     # Split into subregions for better analysis
-    # Upper part (eyelid area) and lower part (pupil/iris area)
-    upper_roi = roi[0:int(height*0.4), :]
-    lower_roi = roi[int(height*0.4):, :]
+    upper_roi = roi[0:int(height*0.4), :]  # Eyelid area
+    lower_roi = roi[int(height*0.4):, :]   # Pupil/iris area
     
     metrics = {}
     
     # 1. Upper region analysis (eyelid movement)
     if upper_roi.size > 0:
-        metrics['upper_variance'] = np.var(upper_roi) / 500  # Normalized
+        metrics['upper_variance'] = np.var(upper_roi) / 500
         metrics['upper_edges'] = np.sum(cv2.Canny(upper_roi, 30, 100) > 0) / upper_roi.size
     else:
         metrics['upper_variance'] = 0.3
@@ -95,7 +126,6 @@ def calculate_vr_eye_state(frame):
     metrics['whole_edges'] = np.sum(cv2.Canny(roi, 30, 100) > 0) / roi.size
     
     # Weighted combination for VR side-camera
-    # Emphasize upper region for blink detection (eyelid movement)
     openness = (
         metrics['upper_variance'] * 0.35 +      # Eyelid texture
         metrics['upper_edges'] * 0.25 +         # Eyelid edges
@@ -105,7 +135,6 @@ def calculate_vr_eye_state(frame):
     )
     
     # Adjust for VR camera characteristics
-    # VR footage typically has lower overall values due to angle and lighting
     openness = openness * 1.3  # Compensate for generally lower values
     
     return max(0.1, min(0.9, openness)), eye_region
@@ -119,9 +148,6 @@ def calculate_vr_adaptive_threshold(openness_values):
     
     values = np.array(openness_values)
     
-    # VR footage typically has:
-    # - Lower mean values (0.3-0.5 range)
-    # - Smaller variance
     mean_val = np.mean(values)
     std_val = np.std(values)
     q25 = np.percentile(values, 25)
@@ -199,37 +225,48 @@ def process_vr_video(video_path, user_threshold=None):
 def detect_vr_blinks(openness_values, threshold=0.22, min_duration=2):
     """Blink detection optimized for VR footage"""
     # Smooth specifically for VR signal characteristics
-    openness_smoothed = medfilt(openness_values, 5)
+    openness_smoothed = moving_median_filter(openness_values, 5)
     
-    # Find blinks as valleys in the signal
-    valleys, properties = find_peaks(
-        1 - np.array(openness_smoothed),
-        height=1-threshold,
-        distance=min_duration,
-        prominence=0.08,  # Lower prominence for VR
-        width=min_duration
-    )
+    # Invert signal to find valleys as peaks
+    inverted_signal = 1 - np.array(openness_smoothed)
     
+    # Simple blink detection - find frames below threshold
     blinks = []
-    for valley in valleys:
-        if openness_smoothed[valley] < threshold:
-            # Simple blink event - valley frame
-            blinks.append((valley, valley, valley))
+    consecutive_low = 0
+    blink_start = None
+    
+    for i, value in enumerate(openness_smoothed):
+        if value < threshold:
+            if blink_start is None:
+                blink_start = i
+            consecutive_low += 1
+        else:
+            if blink_start is not None and consecutive_low >= min_duration:
+                # Valid blink detected
+                blink_center = blink_start + consecutive_low // 2
+                blinks.append((blink_center, blink_start, i))
+            blink_start = None
+            consecutive_low = 0
+    
+    # Check if blink continues to the end
+    if blink_start is not None and consecutive_low >= min_duration:
+        blink_center = blink_start + consecutive_low // 2
+        blinks.append((blink_center, blink_start, len(openness_smoothed)))
     
     return blinks, openness_smoothed
 
 def main():
     st.title("👁️ VR Eye Blink Analyzer")
-    st.markdown("**Optimizirano za VR headset side-camera snimke**")
+    st.markdown("**Optimized for VR headset side-camera footage**")
     
     uploaded_file = st.file_uploader(
-        "Uploadaj VR eye-tracking video", 
+        "Upload VR eye-tracking video", 
         type=['mp4', 'mov', 'avi', 'mkv', 'webm']
     )
     
     if uploaded_file is not None:
         if uploaded_file.size > 200 * 1024 * 1024:
-            st.error("Video prevelik! Maksimalno 200MB. Smanji video prije uploada.")
+            st.error("Video too large! Maximum 200MB. Reduce video size before upload.")
             return
             
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
@@ -262,13 +299,13 @@ def main():
             with col2:
                 if auto_mode == "Manual":
                     threshold = st.slider("Threshold", 0.15, 0.35, 0.22, 0.01,
-                                        help="Niže vrijednosti = osjetljivije")
+                                        help="Lower values = more sensitive")
                 else:
                     threshold = st.slider("Base Sensitivity", 0.18, 0.28, 0.22, 0.01,
-                                        help="Početna osjetljivost za auto-mode")
+                                        help="Base sensitivity for auto-mode")
             with col3:
                 min_duration = st.slider("Min Duration", 1, 5, 2,
-                                       help="Minimalno trajanje treptaja (frejmovi)")
+                                       help="Minimum blink duration (frames)")
             
             if st.button("🚀 START VR BLINK ANALYSIS", type="primary"):
                 with st.spinner("Processing VR footage..."):
@@ -278,7 +315,7 @@ def main():
                     )
                 
                 if not openness_values:
-                    st.error("Nema podataka za analizu. Provjeri video format.")
+                    st.error("No data for analysis. Check video format.")
                     return
                 
                 # Calculate VR-optimized threshold
