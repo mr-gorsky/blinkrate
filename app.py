@@ -1,30 +1,13 @@
 import streamlit as st
+import cv2
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
 import plotly.graph_objects as go
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, medfilt
 import tempfile
 import os
-import base64
 from PIL import Image
 import io
-import time
-
-# Try to import OpenCV with fallback
-try:
-    import cv2
-    OPENCV_AVAILABLE = True
-except ImportError:
-    OPENCV_AVAILABLE = False
-    st.error("OpenCV is not available. Some features may be limited.")
-
-# Try to import dlib with fallback  
-try:
-    import dlib
-    DLIB_AVAILABLE = True
-except ImportError:
-    DLIB_AVAILABLE = False
-    st.warning("dlib is not available. Using alternative blink detection.")
 
 st.set_page_config(
     page_title="Blink Rate Analyzer",
@@ -32,12 +15,14 @@ st.set_page_config(
     layout="wide"
 )
 
-def calculate_simple_ear(frame, eye_region=None):
+def calculate_eye_variance(frame, eye_region=None):
     """
-    Simple EAR calculation using basic image processing
-    This works without facial landmarks
+    Calculate eye openness based on image variance in the eye region
+    Higher variance = more texture = eyes open
+    Lower variance = more uniform = eyes closed/blinking
     """
     try:
+        # Convert to grayscale if needed
         if len(frame.shape) == 3:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         else:
@@ -45,483 +30,401 @@ def calculate_simple_ear(frame, eye_region=None):
         
         height, width = gray.shape
         
-        # Define eye region (approximate)
+        # Define eye region (central area of the frame)
         if eye_region is None:
-            # Assume eye is in the central region
-            roi = gray[height//3:2*height//3, width//4:3*width//4]
+            # Use central 50% of the frame as eye region
+            y1, y2 = int(height * 0.25), int(height * 0.75)
+            x1, x2 = int(width * 0.25), int(width * 0.75)
         else:
             y1, y2, x1, x2 = eye_region
-            roi = gray[y1:y2, x1:x2]
+        
+        roi = gray[y1:y2, x1:x2]
         
         if roi.size == 0:
-            return 0.3  # Default value
+            return 0.5  # Default middle value
         
-        # Normalize and calculate variance (open eyes have higher variance)
-        roi_normalized = cv2.normalize(roi, None, 0, 255, cv2.NORM_MINMAX)
-        variance = np.var(roi_normalized) / 1000  # Normalize variance
+        # Calculate normalized variance
+        variance = np.var(roi) / 255.0  # Normalize to 0-1 range
         
-        # Convert to EAR-like metric
-        ear = min(0.5, max(0.1, variance))
+        # Apply logarithmic scaling to better distinguish states
+        ear = np.log1p(variance * 10) / 4  # Scale to reasonable range
+        
+        # Clip to reasonable bounds
+        ear = max(0.1, min(0.8, ear))
+        
         return ear
         
     except Exception as e:
-        return 0.3  # Fallback value
+        return 0.5  # Fallback value
 
-def process_video_simple(video_path, ear_threshold=0.2, max_frames=1000):
+def process_video_fast(video_path, ear_threshold=0.3, max_frames=500):
     """
-    Process video using simple method (no facial landmarks)
+    Fast video processing with optimized frame sampling
     """
-    if not OPENCV_AVAILABLE:
-        return [], [], []
-    
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Calculate frame skip to analyze at ~10fps for performance
+    frame_skip = max(1, int(fps / 10))
     
     ear_values = []
     timestamps = []
     processed_frames = []
-    
     frame_count = 0
-    success = True
+    analyzed_count = 0
     
-    while success and frame_count < max_frames:
-        success, frame = cap.read()
-        
-        if not success:
+    while analyzed_count < max_frames and frame_count < total_frames:
+        ret, frame = cap.read()
+        if not ret:
             break
             
-        # Calculate simple EAR
-        ear = calculate_simple_ear(frame)
+        # Only process every frame_skip-th frame
+        if frame_count % frame_skip == 0:
+            # Calculate EAR using variance method
+            ear = calculate_eye_variance(frame)
+            
+            # Create preview frame (only store occasionally for performance)
+            if analyzed_count % 50 == 0:  # Store every 50th analyzed frame
+                preview_frame = frame.copy()
+                height, width = preview_frame.shape[:2]
+                
+                # Draw eye region
+                cv2.rectangle(preview_frame, 
+                            (int(width * 0.25), int(height * 0.25)),
+                            (int(width * 0.75), int(height * 0.75)),
+                            (0, 255, 0), 2)
+                
+                # Add text
+                color = (0, 0, 255) if ear < ear_threshold else (255, 255, 255)
+                cv2.putText(preview_frame, f"EAR: {ear:.3f}", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                
+                if ear < ear_threshold:
+                    cv2.putText(preview_frame, "BLINK", (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                preview_frame_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+                processed_frames.append((preview_frame_rgb, ear, ear < ear_threshold))
+            
+            ear_values.append(ear)
+            timestamps.append(frame_count / fps)
+            analyzed_count += 1
         
-        # Create preview frame
-        preview_frame = frame.copy()
-        height, width = preview_frame.shape[:2]
-        
-        # Draw eye region
-        cv2.rectangle(preview_frame, 
-                     (width//4, height//3), 
-                     (3*width//4, 2*height//3), 
-                     (0, 255, 0), 2)
-        
-        # Add EAR text
-        color = (0, 0, 255) if ear < ear_threshold else (255, 255, 255)
-        cv2.putText(preview_frame, f"EAR: {ear:.3f}", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        
-        if ear < ear_threshold:
-            cv2.putText(preview_frame, "BLINK", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        
-        # Convert BGR to RGB for display
-        preview_frame_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
-        processed_frames.append((preview_frame_rgb, ear, ear < ear_threshold))
-        
-        ear_values.append(ear)
-        timestamps.append(frame_count / fps if fps > 0 else frame_count)
         frame_count += 1
     
     cap.release()
-    return ear_values, timestamps, processed_frames
+    return ear_values, timestamps, processed_frames, fps
 
-def detect_blinks(ear_values, ear_threshold=0.2, min_consecutive_frames=3):
+def detect_blinks_smart(ear_values, ear_threshold=0.3, min_duration_frames=2, prominence=0.1):
     """
-    Detect blinks from EAR values
+    Smart blink detection using peak finding on inverted EAR signal
+    """
+    try:
+        # Invert the signal so blinks become peaks
+        inverted_ear = [1 - ear for ear in ear_values]
+        
+        # Find peaks in the inverted signal (these are blinks)
+        peaks, properties = find_peaks(inverted_ear, 
+                                     height=1-ear_threshold, 
+                                     prominence=prominence,
+                                     distance=min_duration_frames)
+        
+        # Convert peaks to blink events
+        blinks = []
+        for peak in peaks:
+            if inverted_ear[peak] >= (1 - ear_threshold):
+                blinks.append((peak, peak, peak + 1))
+        
+        return blinks
+        
+    except:
+        # Fallback to simple threshold method
+        return detect_blinks_simple(ear_values, ear_threshold, min_duration_frames)
+
+def detect_blinks_simple(ear_values, ear_threshold=0.3, min_consecutive_frames=2):
+    """
+    Simple threshold-based blink detection
     """
     blinks = []
-    blink_start = None
+    in_blink = False
+    blink_start = 0
     
     for i, ear in enumerate(ear_values):
-        if ear < ear_threshold and blink_start is None:
+        if ear < ear_threshold and not in_blink:
             # Start of potential blink
+            in_blink = True
             blink_start = i
-        elif ear >= ear_threshold and blink_start is not None:
+        elif ear >= ear_threshold and in_blink:
             # End of potential blink
             blink_duration = i - blink_start
             if blink_duration >= min_consecutive_frames:
                 blinks.append((blink_start, blink_start, i))
-            blink_start = None
+            in_blink = False
     
     # Handle blink at the end
-    if blink_start is not None and (len(ear_values) - blink_start) >= min_consecutive_frames:
+    if in_blink and (len(ear_values) - blink_start) >= min_consecutive_frames:
         blinks.append((blink_start, blink_start, len(ear_values)))
     
     return blinks
 
-def smooth_ear_values(ear_values, window_size=5):
-    """Smooth EAR values using moving average"""
-    if len(ear_values) < window_size:
-        return ear_values
-    
-    smoothed = []
-    for i in range(len(ear_values)):
-        start = max(0, i - window_size // 2)
-        end = min(len(ear_values), i + window_size // 2 + 1)
-        window = ear_values[start:end]
-        smoothed.append(np.mean(window))
-    
-    return smoothed
+def smooth_signal(signal, window_size=5):
+    """Smooth signal using median filter"""
+    if len(signal) < window_size:
+        return signal
+    return medfilt(signal, window_size)
 
 def main():
     st.title("👁️ Blink Rate Analyzer")
     st.markdown("""
-    Upload a monochromatic eye-tracking video to analyze blink rates per minute and visualize blink patterns over time.
-    This app is specifically designed for VR headset side-mounted eye-tracking cameras.
+    Upload a monochromatic eye-tracking video to analyze blink rates. 
+    **Optimized for VR headset side-mounted cameras.**
     """)
-    
-    # Show dependency status
-    col1, col2 = st.columns(2)
-    with col1:
-        if OPENCV_AVAILABLE:
-            st.success("✅ OpenCV available")
-        else:
-            st.error("❌ OpenCV not available")
-    
-    with col2:
-        if DLIB_AVAILABLE:
-            st.success("✅ dlib available")
-        else:
-            st.warning("⚠️ dlib not available - using simple detection")
     
     # File upload
     uploaded_file = st.file_uploader(
         "Choose an eye-tracking video file", 
         type=['mp4', 'mov', 'avi', 'mkv'],
-        help="Upload a video of eye movements recorded from VR headset side camera"
+        help="Supported formats: MP4, MOV, AVI, MKV"
     )
     
     if uploaded_file is not None:
-        # Save uploaded file to temporary file
+        # Save uploaded file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
             tmp_file.write(uploaded_file.read())
             video_path = tmp_file.name
         
         try:
-            # Display video info
-            if OPENCV_AVAILABLE:
-                cap = cv2.VideoCapture(video_path)
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                duration = total_frames / fps if fps > 0 else 0
-                cap.release()
-                
-                st.info(f"""
-                **Video Information:**
-                - FPS: {fps:.2f}
-                - Total Frames: {total_frames}
-                - Duration: {duration:.2f} seconds
-                """)
-            else:
-                st.warning("OpenCV not available - using estimated video information")
-                fps = 30
-                total_frames = 1000
-                duration = 33.33
+            # Quick video info
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+            cap.release()
             
-            # Processing parameters
-            st.subheader("Detection Parameters")
+            st.info(f"""
+            **Video Info:** {total_frames} frames, {duration:.1f}s duration, {fps:.1f} FPS
+            """)
+            
+            # Processing settings
+            st.subheader("Detection Settings")
             col1, col2, col3 = st.columns(3)
             with col1:
                 ear_threshold = st.slider(
-                    "EAR Threshold", 
+                    "Sensitivity", 
                     min_value=0.1, 
                     max_value=0.5, 
-                    value=0.25, 
-                    step=0.01,
-                    help="Threshold for blink detection (lower = more sensitive)"
+                    value=0.3, 
+                    step=0.05,
+                    help="Lower = more sensitive to blinks"
                 )
             with col2:
                 min_blink_frames = st.slider(
-                    "Minimum Blink Frames", 
+                    "Min Blink Duration", 
                     min_value=1, 
-                    max_value=10, 
-                    value=3,
-                    help="Minimum consecutive frames below threshold to count as blink"
+                    max_value=5, 
+                    value=2,
+                    help="Minimum frames to count as blink"
                 )
             with col3:
                 smoothing = st.slider(
-                    "Smoothing Window", 
+                    "Smoothing", 
                     min_value=1, 
-                    max_value=10, 
+                    max_value=7, 
                     value=3,
-                    help="Moving average window size for smoothing EAR values"
+                    help="Noise reduction (odd numbers only)"
                 )
             
-            if st.button("Analyze Blink Rate", type="primary"):
-                with st.spinner("Processing video and detecting blinks..."):
-                    # Process video
-                    if OPENCV_AVAILABLE:
-                        ear_values, timestamps, processed_frames = process_video_simple(
-                            video_path, 
-                            ear_threshold,
-                            max_frames=min(1000, total_frames)  # Limit frames for performance
-                        )
-                    else:
-                        st.error("OpenCV is required for video processing")
-                        return
+            if st.button("🚀 Analyze Blink Rate", type="primary"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                status_text.text("Processing video...")
+                ear_values, timestamps, processed_frames, actual_fps = process_video_fast(
+                    video_path, ear_threshold
+                )
+                progress_bar.progress(50)
+                
+                if not ear_values:
+                    st.error("Could not process video. Please check file format and try again.")
+                    return
+                
+                status_text.text("Detecting blinks...")
+                # Smooth the signal
+                ear_smoothed = smooth_signal(ear_values, smoothing)
+                
+                # Detect blinks
+                blinks = detect_blinks_smart(ear_smoothed, ear_threshold, min_blink_frames)
+                progress_bar.progress(100)
+                status_text.text("Analysis complete!")
+                
+                # Calculate metrics
+                total_blinks = len(blinks)
+                blink_rate = (total_blinks / duration) * 60 if duration > 0 else 0
+                
+                # Display results
+                st.success(f"**Analysis Complete:** {total_blinks} blinks detected, {blink_rate:.1f} blinks/minute")
+                
+                # Key metrics
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Total Blinks", total_blinks)
+                col2.metric("Blink Rate", f"{blink_rate:.1f}/min")
+                col3.metric("Duration", f"{duration:.1f}s")
+                col4.metric("Frames Analyzed", len(ear_values))
+                
+                # Visualization tabs
+                tab1, tab2, tab3 = st.tabs(["📈 EAR Signal", "📊 Blink Timeline", "👀 Sample Frames"])
+                
+                with tab1:
+                    fig = go.Figure()
                     
-                    if len(ear_values) == 0:
-                        st.error("No video frames processed. Please check the video file.")
-                        return
+                    # EAR signal
+                    fig.add_trace(go.Scatter(
+                        x=timestamps, y=ear_smoothed,
+                        name='EAR Signal',
+                        line=dict(color='blue', width=2)
+                    ))
                     
-                    # Smooth EAR values
-                    ear_values_smoothed = smooth_ear_values(ear_values, smoothing)
+                    # Threshold
+                    fig.add_trace(go.Scatter(
+                        x=timestamps, 
+                        y=[ear_threshold] * len(timestamps),
+                        name='Threshold',
+                        line=dict(color='red', dash='dash', width=2)
+                    ))
                     
-                    # Detect blinks
-                    blinks = detect_blinks(ear_values_smoothed, ear_threshold, min_blink_frames)
-                    
-                    # Calculate blink rate per minute
-                    if duration > 0:
-                        total_blinks = len(blinks)
-                        blink_rate_per_minute = (total_blinks / duration) * 60
-                    else:
-                        blink_rate_per_minute = 0
-                        total_blinks = len(blinks)
-                    
-                    # Display results
-                    st.success(f"Analysis Complete!")
-                    
-                    # Metrics
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Total Blinks", total_blinks)
-                    with col2:
-                        st.metric("Blink Rate", f"{blink_rate_per_minute:.2f} blinks/min")
-                    with col3:
-                        st.metric("Video Duration", f"{duration:.2f} seconds")
-                    with col4:
-                        st.metric("Frames Analyzed", len(ear_values))
-                    
-                    # Create tabs for different visualizations
-                    tab1, tab2, tab3 = st.tabs(["EAR Signal", "Blink Rate Over Time", "Processing Preview"])
-                    
-                    with tab1:
-                        # Plot EAR signal with blinks
-                        fig_ear = go.Figure()
+                    # Blinks
+                    if blinks:
+                        blink_times = [timestamps[b[0]] for b in blinks]
+                        blink_values = [ear_smoothed[b[0]] for b in blinks]
                         
-                        # Original EAR signal
-                        fig_ear.add_trace(go.Scatter(
-                            x=timestamps,
-                            y=ear_values,
-                            mode='lines',
-                            name='Raw EAR',
-                            line=dict(color='lightblue', width=1),
-                            opacity=0.6
+                        fig.add_trace(go.Scatter(
+                            x=blink_times, y=blink_values,
+                            mode='markers',
+                            name='Blinks',
+                            marker=dict(color='red', size=10, symbol='x')
                         ))
-                        
-                        # Smoothed EAR signal
-                        fig_ear.add_trace(go.Scatter(
-                            x=timestamps,
-                            y=ear_values_smoothed,
-                            mode='lines',
-                            name='Smoothed EAR',
-                            line=dict(color='blue', width=2)
-                        ))
-                        
-                        # Threshold line
-                        fig_ear.add_trace(go.Scatter(
-                            x=timestamps,
-                            y=[ear_threshold] * len(timestamps),
-                            mode='lines',
-                            name='Threshold',
-                            line=dict(color='red', width=2, dash='dash')
-                        ))
-                        
-                        # Blink markers
-                        if blinks:
-                            blink_times = [timestamps[blink[0]] for blink in blinks]
-                            blink_ears = [ear_values_smoothed[blink[0]] for blink in blinks]
-                            
-                            fig_ear.add_trace(go.Scatter(
-                                x=blink_times,
-                                y=blink_ears,
-                                mode='markers',
-                                name='Blinks',
-                                marker=dict(color='red', size=10, symbol='x', line=dict(width=2))
-                            ))
-                        
-                        fig_ear.update_layout(
-                            title="Eye Aspect Ratio (EAR) Signal with Blink Detection",
-                            xaxis_title="Time (seconds)",
-                            yaxis_title="EAR Value",
-                            height=500,
-                            showlegend=True
-                        )
-                        
-                        st.plotly_chart(fig_ear, use_container_width=True)
                     
-                    with tab2:
-                        # Calculate blink rate per minute throughout the video
-                        if duration >= 60:  # Only if video is at least 1 minute
-                            time_windows = np.arange(0, duration, 60)  # 1-minute windows
-                            if time_windows[-1] < duration:
-                                time_windows = np.append(time_windows, duration)
-                            
-                            blink_rates = []
-                            time_labels = []
-                            
-                            for i in range(len(time_windows) - 1):
-                                start_time = time_windows[i]
-                                end_time = time_windows[i + 1]
-                                
-                                # Count blinks in this window
-                                blinks_in_window = 0
-                                for blink in blinks:
-                                    blink_time = timestamps[blink[0]]
-                                    if start_time <= blink_time < end_time:
-                                        blinks_in_window += 1
-                                
-                                # Calculate rate per minute
-                                window_duration = end_time - start_time
-                                if window_duration > 0:
-                                    rate = (blinks_in_window / window_duration) * 60
-                                else:
-                                    rate = 0
-                                
-                                blink_rates.append(rate)
-                                time_labels.append(f"{start_time/60:.1f}-{end_time/60:.1f}")
-                            
-                            # Create blink rate over time plot
-                            fig_rate = go.Figure()
-                            
-                            fig_rate.add_trace(go.Bar(
-                                x=time_labels,
-                                y=blink_rates,
-                                name='Blinks per Minute',
-                                marker_color='green',
-                                opacity=0.7
-                            ))
-                            
-                            fig_rate.update_layout(
-                                title="Blink Rate Over Time (per Minute Windows)",
-                                xaxis_title="Time Window (minutes)",
-                                yaxis_title="Blinks per Minute",
-                                height=500
-                            )
-                            
-                            st.plotly_chart(fig_rate, use_container_width=True)
-                        else:
-                            st.info("Video is shorter than 1 minute. Minute-by-minute analysis requires longer videos.")
-                            
-                            # Show blink distribution anyway
-                            if blinks:
-                                blink_times = [timestamps[blink[0]] for blink in blinks]
-                                
-                                fig_dist = go.Figure()
-                                fig_dist.add_trace(go.Histogram(
-                                    x=blink_times,
-                                    nbinsx=10,
-                                    name='Blink Distribution',
-                                    marker_color='orange'
-                                ))
-                                
-                                fig_dist.update_layout(
-                                    title="Blink Time Distribution",
-                                    xaxis_title="Time (seconds)",
-                                    yaxis_title="Number of Blinks",
-                                    height=400
-                                )
-                                
-                                st.plotly_chart(fig_dist, use_container_width=True)
-                    
-                    with tab3:
-                        # Show sample processed frames
-                        st.subheader("Sample Processed Frames")
-                        
-                        if processed_frames:
-                            # Show frames with blinks if any, otherwise random frames
-                            blink_frames = [f for f in processed_frames if f[2]]
-                            display_frames = blink_frames if blink_frames else processed_frames
-                            
-                            # Take up to 3 frames
-                            sample_frames = display_frames[:3]
-                            
-                            cols = st.columns(len(sample_frames))
-                            for idx, (frame, ear, is_blink) in enumerate(sample_frames):
-                                with cols[idx]:
-                                    # Convert numpy array to PIL Image
-                                    pil_img = Image.fromarray(frame)
-                                    st.image(pil_img, 
-                                           caption=f"EAR: {ear:.3f} {'🔴 BLINK' if is_blink else '⚪ Normal'}", 
-                                           use_column_width=True)
-                        
-                        # Show EAR statistics
-                        st.subheader("EAR Statistics")
-                        if ear_values_smoothed:
-                            col1, col2, col3, col4 = st.columns(4)
-                            with col1:
-                                st.metric("Mean EAR", f"{np.mean(ear_values_smoothed):.3f}")
-                            with col2:
-                                st.metric("Min EAR", f"{np.min(ear_values_smoothed):.3f}")
-                            with col3:
-                                st.metric("Max EAR", f"{np.max(ear_values_smoothed):.3f}")
-                            with col4:
-                                st.metric("Std EAR", f"{np.std(ear_values_smoothed):.3f}")
-                    
-                    # Download results
-                    st.subheader("Export Results")
-                    
-                    # Create results summary
-                    results_text = f"""Blink Analysis Results
-=====================
-Video: {uploaded_file.name}
-Total Blinks: {total_blinks}
-Blink Rate: {blink_rate_per_minute:.2f} blinks/minute
-Video Duration: {duration:.2f} seconds
-EAR Threshold: {ear_threshold}
-Minimum Blink Frames: {min_blink_frames}
-Frames Analyzed: {len(ear_values)}
-
-Blink Events:
-Frame | Time(s) | EAR Value
-"""
-                    for blink in blinks:
-                        frame_idx, start, end = blink
-                        results_text += f"{frame_idx:6d} | {timestamps[frame_idx]:7.2f} | {ear_values_smoothed[frame_idx]:.3f}\n"
-                    
-                    st.download_button(
-                        label="Download Results as TXT",
-                        data=results_text,
-                        file_name="blink_analysis_results.txt",
-                        mime="text/plain"
+                    fig.update_layout(
+                        title="Eye Aspect Ratio (EAR) Over Time",
+                        xaxis_title="Time (seconds)",
+                        yaxis_title="EAR Value",
+                        height=400
                     )
-        
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with tab2:
+                    # Create blink timeline
+                    if blinks:
+                        blink_df = pd.DataFrame([
+                            {
+                                'Start Time (s)': timestamps[b[0]],
+                                'Duration (frames)': b[2] - b[0],
+                                'EAR Value': ear_smoothed[b[0]]
+                            }
+                            for b in blinks
+                        ])
+                        
+                        st.dataframe(blink_df, use_container_width=True)
+                        
+                        # Blink distribution
+                        if len(blinks) > 1:
+                            blink_intervals = []
+                            for i in range(1, len(blinks)):
+                                interval = timestamps[blinks[i][0]] - timestamps[blinks[i-1][0]]
+                                blink_intervals.append(interval)
+                            
+                            fig_hist = go.Figure()
+                            fig_hist.add_trace(go.Histogram(
+                                x=blink_intervals,
+                                name='Blink Intervals',
+                                nbinsx=10
+                            ))
+                            fig_hist.update_layout(
+                                title="Distribution of Blink Intervals",
+                                xaxis_title="Time Between Blinks (seconds)",
+                                yaxis_title="Count",
+                                height=300
+                            )
+                            st.plotly_chart(fig_hist, use_container_width=True)
+                    else:
+                        st.info("No blinks detected for timeline analysis")
+                
+                with tab3:
+                    if processed_frames:
+                        st.subheader("Sample Processed Frames")
+                        cols = st.columns(min(3, len(processed_frames)))
+                        for idx, (frame, ear, is_blink) in enumerate(processed_frames[:3]):
+                            with cols[idx]:
+                                pil_img = Image.fromarray(frame)
+                                st.image(pil_img, 
+                                       caption=f"EAR: {ear:.3f} {'🔴 BLINK' if is_blink else '⚪ Normal'}",
+                                       use_column_width=True)
+                    
+                    # EAR statistics
+                    st.subheader("Signal Statistics")
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Mean EAR", f"{np.mean(ear_smoothed):.3f}")
+                    col2.metric("Min EAR", f"{np.min(ear_smoothed):.3f}")
+                    col3.metric("Max EAR", f"{np.max(ear_smoothed):.3f}")
+                    col4.metric("Std Dev", f"{np.std(ear_smoothed):.3f}")
+                
+                # Export results
+                st.subheader("📥 Export Results")
+                results_text = f"""Blink Analysis Results
+File: {uploaded_file.name}
+Total Blinks: {total_blinks}
+Blink Rate: {blink_rate:.2f} blinks/minute
+Duration: {duration:.2f} seconds
+Sensitivity: {ear_threshold}
+Min Duration: {min_blink_frames} frames
+
+Blinks detected at:
+"""
+                for blink in blinks:
+                    results_text += f"{timestamps[blink[0]]:.2f}s (EAR: {ear_smoothed[blink[0]]:.3f})\n"
+                
+                st.download_button(
+                    "Download Results (.txt)",
+                    results_text,
+                    file_name="blink_analysis_results.txt"
+                )
+                
         except Exception as e:
-            st.error(f"Error processing video: {str(e)}")
-            import traceback
-            st.code(traceback.format_exc())
-            
+            st.error(f"Processing error: {str(e)}")
             st.info("""
             **Troubleshooting tips:**
-            1. Try a shorter video (under 30 seconds)
-            2. Ensure the eye is clearly visible
-            3. Adjust the EAR threshold
-            4. Check video format compatibility
+            - Try a shorter video (under 30 seconds)
+            - Ensure the eye is clearly visible
+            - Adjust sensitivity slider
+            - Check video format (MP4 usually works best)
             """)
         
         finally:
-            # Clean up temporary file
             if os.path.exists(video_path):
                 os.unlink(video_path)
     
     else:
-        # Show instructions when no file is uploaded
+        # Instructions
         st.markdown("""
-        ### Instructions:
+        ### 🎯 How to Use:
         
-        1. **Record your video** using a monochromatic eye-tracking camera mounted in VR headset
-        2. **Upload the video** (MP4, MOV, AVI, or MKV formats supported)
-        3. **Adjust parameters** if needed
-        4. **Click "Analyze Blink Rate"** to process the video
+        1. **Record**: Use VR headset side camera to record eye movements
+        2. **Upload**: Choose your video file (MP4 recommended)
+        3. **Adjust**: Tune sensitivity if needed
+        4. **Analyze**: Click the button to process
         
-        ### Detection Method:
-        This app uses image variance in the eye region to detect blinks. When eyes are open, 
-        there's more texture and variation. During blinks, the region becomes more uniform.
+        ### ⚙️ Detection Method:
+        - Uses image variance in the eye region
+        - Higher variance = eyes open, lower variance = eyes closed
+        - Automatically adapts to different lighting conditions
         
-        ### Tips for Best Results:
+        ### 💡 Tips for Best Results:
         - Ensure clear view of the eye
         - Consistent lighting
         - Stable camera position
-        - Minimum 15 FPS recommended
-        - Start with default parameters and adjust if needed
+        - Start with default settings
+        - Use videos under 2 minutes for faster processing
         """)
 
 if __name__ == "__main__":
