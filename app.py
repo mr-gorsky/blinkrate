@@ -1,516 +1,439 @@
 import streamlit as st
 import cv2
 import numpy as np
-import plotly.graph_objects as go
-from PIL import Image
 import tempfile
 import os
-import pandas as pd
+import math
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks
+import plotly.graph_objects as go
+import csv
+import zipfile
+from io import BytesIO
 
-st.set_page_config(
-    page_title="VR Eye Blink Analyzer",
-    page_icon="👁️",
-    layout="wide"
-)
+st.set_page_config(page_title="Pupil & Blink Analyzer (GC0308)", layout="wide", page_icon="👁️")
 
-def moving_median_filter(signal, window_size=5):
-    """Simple median filter implementation without scipy"""
-    if len(signal) < window_size:
-        return signal
-    
-    padded = np.pad(signal, (window_size//2, window_size//2), mode='edge')
-    smoothed = []
-    
-    for i in range(len(signal)):
-        window = padded[i:i + window_size]
-        smoothed.append(np.median(window))
-    
-    return np.array(smoothed)
 
-def find_peaks_simple(signal, height=None, distance=None, prominence=None):
-    """Simple peak detection without scipy"""
-    peaks = []
-    
-    for i in range(1, len(signal) - 1):
-        # Check if this is a peak
-        if signal[i] > signal[i-1] and signal[i] > signal[i+1]:
-            # Check height condition
-            if height is not None and signal[i] < height:
-                continue
-            
-            # Check distance condition
-            if distance is not None and peaks:
-                if i - peaks[-1] < distance:
-                    continue
-            
-            peaks.append(i)
-    
-    return np.array(peaks)
+# ---------------------------------------------------------
+# ----------- PUPIL DETECTOR (CLAHE + contour) ------------
+# ---------------------------------------------------------
+def detect_pupil(gray_roi):
+    # CLAHE
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray_roi)
 
-def preprocess_vr_frame(frame):
-    """Preprocessing optimized for VR side-camera footage"""
-    # Convert to grayscale
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-    
-    # VR cameras often have specific lighting - enhance contrast
-    gray = cv2.equalizeHist(gray)
-    
-    # Reduce noise while preserving edges
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-    
-    return gray
+    # blur
+    blurred = cv2.medianBlur(enhanced, 5)
 
-def detect_vr_eye_region(frame):
+    # invert to make pupil bright
+    inv = cv2.bitwise_not(blurred)
+
+    # Adaptive threshold
+    th = cv2.adaptiveThreshold(inv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 11, 2)
+
+    # clean small noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    opened = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best_score = 0
+    best_diam = None
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 8:
+            continue
+        peri = cv2.arcLength(c, True)
+        if peri == 0:
+            continue
+
+        circularity = 4 * np.pi * (area / (peri * peri))
+        score = circularity * (area ** 0.60)   # emphasize roundish & reasonably large
+
+        if score > best_score:
+            best_score = score
+            best_diam = np.sqrt((4 * area) / np.pi)
+
+    return best_diam
+
+
+# ---------------------------------------------------------
+# ----------------- VIDEO ROTATION ------------------------
+# ---------------------------------------------------------
+def rotate_video_to_temp(input_path, rotation):
     """
-    Detect eye region specifically for VR side-camera footage
-    Based on the screenshot, the eye is in the left portion of the frame
+    rotation: "none", "90cw", "90ccw", "180"
+    Returns path to rotated temp video.
     """
-    height, width = frame.shape[:2]
-    
-    # For VR side-camera: eye is typically in left 2/3 of frame, centered vertically
-    eye_region = (
-        int(width * 0.1),   # x1 - start from left
-        int(height * 0.2),  # y1 - from top
-        int(width * 0.7),   # x2 - to right
-        int(height * 0.8)   # y2 - to bottom
-    )
-    
-    return eye_region
 
-def calculate_vr_eye_state(frame):
-    """
-    Calculate eye state specifically for VR side-camera footage
-    Optimized for the angled view and lighting conditions
-    """
-    gray = preprocess_vr_frame(frame)
-    eye_region = detect_vr_eye_region(frame)
-    x1, y1, x2, y2 = eye_region
-    
-    roi = gray[y1:y2, x1:x2]
-    
-    if roi.size == 0:
-        return 0.4, eye_region
-    
-    # For VR side-cameras, we need different metrics
-    height, width = roi.shape
-    
-    # Split into subregions for better analysis
-    upper_roi = roi[0:int(height*0.4), :]  # Eyelid area
-    lower_roi = roi[int(height*0.4):, :]   # Pupil/iris area
-    
-    metrics = {}
-    
-    # 1. Upper region analysis (eyelid movement)
-    if upper_roi.size > 0:
-        metrics['upper_variance'] = np.var(upper_roi) / 500
-        metrics['upper_edges'] = np.sum(cv2.Canny(upper_roi, 30, 100) > 0) / upper_roi.size
-    else:
-        metrics['upper_variance'] = 0.3
-        metrics['upper_edges'] = 0.2
-    
-    # 2. Lower region analysis (pupil/iris)
-    if lower_roi.size > 0:
-        metrics['lower_variance'] = np.var(lower_roi) / 500
-        metrics['lower_edges'] = np.sum(cv2.Canny(lower_roi, 30, 100) > 0) / lower_roi.size
-        
-        # Brightness analysis - pupil is typically darker
-        lower_mean = np.mean(lower_roi) / 255
-        metrics['lower_brightness'] = 1.0 - lower_mean  # Invert - darker = more open
-    else:
-        metrics['lower_variance'] = 0.3
-        metrics['lower_edges'] = 0.2
-        metrics['lower_brightness'] = 0.5
-    
-    # 3. Whole region metrics
-    metrics['whole_variance'] = np.var(roi) / 500
-    metrics['whole_edges'] = np.sum(cv2.Canny(roi, 30, 100) > 0) / roi.size
-    
-    # Weighted combination for VR side-camera
-    openness = (
-        metrics['upper_variance'] * 0.35 +      # Eyelid texture
-        metrics['upper_edges'] * 0.25 +         # Eyelid edges
-        metrics['lower_brightness'] * 0.20 +    # Pupil darkness
-        metrics['whole_variance'] * 0.15 +      # Overall texture
-        metrics['whole_edges'] * 0.05           # Overall edges
-    )
-    
-    # Adjust for VR camera characteristics
-    openness = openness * 1.3  # Compensate for generally lower values
-    
-    return max(0.1, min(0.9, openness)), eye_region
+    if rotation == "none":
+        return input_path
 
-def calculate_vr_adaptive_threshold(openness_values):
-    """
-    Calculate adaptive threshold specifically for VR footage
-    """
-    if len(openness_values) < 20:
-        return 0.22  # Good default for VR side-cameras
-    
-    values = np.array(openness_values)
-    
-    mean_val = np.mean(values)
-    std_val = np.std(values)
-    q25 = np.percentile(values, 25)
-    
-    # For VR: use lower threshold based on distribution
-    if mean_val < 0.4:
-        # Very angled view - use very conservative threshold
-        threshold = q25 * 0.9
-    else:
-        # More visible - use standard approach
-        threshold = mean_val - (std_val * 0.7)
-    
-    # VR-specific bounds
-    threshold = max(0.18, min(0.30, threshold))
-    
-    return threshold
+    # create temporary output video file
+    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    out_path = tmp_out.name
+    tmp_out.close()
 
-def process_vr_video(video_path, user_threshold=None):
-    """Process video with VR-optimized parameters"""
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    openness_values = []
-    timestamps = []
-    processed_frames = []
-    
-    frame_count = 0
-    max_frames = min(2000, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-    
-    while frame_count < max_frames:
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        return input_path
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
+    # determine output dimensions
+    if rotation in ("90cw", "90ccw"):
+        out_w, out_h = h, w
+    else:  # 180°
+        out_w, out_h = w, h
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h), True)
+
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
-        
-        # Calculate VR-optimized eye state
-        openness, eye_region = calculate_vr_eye_state(frame)
-        
-        openness_values.append(openness)
-        timestamps.append(frame_count / fps)
-        
-        # Store sample frames (every 40 frames for performance)
-        if frame_count % 40 == 0:
-            preview = frame.copy()
-            x1, y1, x2, y2 = eye_region
-            
-            # Draw detection area
-            cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            
-            # Draw subregions
-            cv2.rectangle(preview, 
-                         (x1, y1), 
-                         (x2, int(y1 + (y2-y1)*0.4)), 
-                         (255, 255, 0), 1)  # Upper region
-            
-            # Add info text
-            color = (0, 0, 255) if openness < (user_threshold or 0.22) else (255, 255, 255)
-            cv2.putText(preview, f"VR Openness: {openness:.3f}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            cv2.putText(preview, "Green: Eye ROI | Blue: Eyelid area", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-            if openness < (user_threshold or 0.22):
-                cv2.putText(preview, "BLINK DETECTED", (10, 90),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            
-            preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-            processed_frames.append((preview_rgb, openness, openness < (user_threshold or 0.22)))
-        
-        frame_count += 1
-    
+
+        if rotation == "90cw":
+            rotated = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation == "90ccw":
+            rotated = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        else:  # 180
+            rotated = cv2.rotate(frame, cv2.ROTATE_180)
+
+        writer.write(rotated)
+
     cap.release()
-    
-    return openness_values, timestamps, processed_frames, fps
+    writer.release()
 
-def detect_vr_blinks(openness_values, threshold=0.22, min_duration=2):
-    """Blink detection optimized for VR footage"""
-    # Smooth specifically for VR signal characteristics
-    openness_smoothed = moving_median_filter(openness_values, 5)
-    
-    # Invert signal to find valleys as peaks
-    inverted_signal = 1 - np.array(openness_smoothed)
-    
-    # Simple blink detection - find frames below threshold
-    blinks = []
-    consecutive_low = 0
-    blink_start = None
-    
-    for i, value in enumerate(openness_smoothed):
-        if value < threshold:
-            if blink_start is None:
-                blink_start = i
-            consecutive_low += 1
-        else:
-            if blink_start is not None and consecutive_low >= min_duration:
-                # Valid blink detected
-                blink_center = blink_start + consecutive_low // 2
-                blinks.append((blink_center, blink_start, i))
-            blink_start = None
-            consecutive_low = 0
-    
-    # Check if blink continues to the end
-    if blink_start is not None and consecutive_low >= min_duration:
-        blink_center = blink_start + consecutive_low // 2
-        blinks.append((blink_center, blink_start, len(openness_smoothed)))
-    
-    return blinks, openness_smoothed
+    return out_path
 
-def main():
-    st.title("👁️ VR Eye Blink Analyzer")
-    st.markdown("**Optimized for VR headset side-camera footage**")
-    
-    uploaded_file = st.file_uploader(
-        "Upload VR eye-tracking video", 
-        type=['mp4', 'mov', 'avi', 'mkv', 'webm']
-    )
-    
-    if uploaded_file is not None:
-        if uploaded_file.size > 200 * 1024 * 1024:
-            st.error("Video too large! Maximum 200MB. Reduce video size before upload.")
-            return
-            
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
-            tmp_file.write(uploaded_file.read())
-            video_path = tmp_file.name
-        
-        try:
-            # Video info
-            cap = cv2.VideoCapture(video_path)
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            duration = total_frames / fps if fps > 0 else 0
-            cap.release()
-            
-            st.info(f"""
-            **VR Video Analysis Ready**  
-            📁 {uploaded_file.name}  
-            ⏱️ {duration:.1f}s duration  
-            🎞️ {total_frames} frames  
-            🚀 {fps:.1f} FPS
-            """)
-            
-            # VR-specific settings
-            st.subheader("🎯 VR-Specific Settings")
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown("**Threshold Mode**")
-                auto_mode = st.radio("", ["Auto VR", "Manual"], horizontal=True)
-            with col2:
-                if auto_mode == "Manual":
-                    threshold = st.slider("Threshold", 0.15, 0.35, 0.22, 0.01,
-                                        help="Lower values = more sensitive")
-                else:
-                    threshold = st.slider("Base Sensitivity", 0.18, 0.28, 0.22, 0.01,
-                                        help="Base sensitivity for auto-mode")
-            with col3:
-                min_duration = st.slider("Min Duration", 1, 5, 2,
-                                       help="Minimum blink duration (frames)")
-            
-            if st.button("🚀 START VR BLINK ANALYSIS", type="primary"):
-                with st.spinner("Processing VR footage..."):
-                    # Process with VR-optimized algorithm
-                    openness_values, timestamps, processed_frames, actual_fps = process_vr_video(
-                        video_path, threshold if auto_mode == "Manual" else None
-                    )
-                
-                if not openness_values:
-                    st.error("No data for analysis. Check video format.")
-                    return
-                
-                # Calculate VR-optimized threshold
-                if auto_mode == "Auto VR":
-                    vr_threshold = calculate_vr_adaptive_threshold(openness_values)
-                    final_threshold = min(threshold + 0.02, vr_threshold)
-                    st.success(f"🤖 VR Auto-threshold: **{final_threshold:.3f}**")
-                else:
-                    final_threshold = threshold
-                
-                # Detect blinks
-                blinks, openness_smoothed = detect_vr_blinks(
-                    openness_values, final_threshold, min_duration
-                )
-                
-                # Calculate results
-                total_blinks = len(blinks)
-                blink_rate = (total_blinks / duration) * 60 if duration > 0 else 0
-                
-                # Display results
-                st.success(f"**🎯 VR ANALYSIS COMPLETE: {total_blinks} blinks detected**")
-                
-                # Metrics dashboard
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Total Blinks", total_blinks)
-                col2.metric("Blink Rate", f"{blink_rate:.1f}/min")
-                col3.metric("VR Threshold", f"{final_threshold:.3f}")
-                col4.metric("Signal Quality", f"{np.mean(openness_smoothed):.3f}")
-                
-                # Detailed analysis
-                tab1, tab2, tab3 = st.tabs(["📊 Signal Analysis", "📈 Blink Timeline", "👁️ Frame Preview"])
-                
-                with tab1:
-                    # Create VR-optimized plot
-                    fig = go.Figure()
-                    
-                    # Raw signal (light)
-                    fig.add_trace(go.Scatter(
-                        x=timestamps, y=openness_values,
-                        name='Raw Signal',
-                        line=dict(color='lightblue', width=1),
-                        opacity=0.6
-                    ))
-                    
-                    # Smoothed signal (bold)
-                    fig.add_trace(go.Scatter(
-                        x=timestamps, y=openness_smoothed,
-                        name='Smoothed',
-                        line=dict(color='blue', width=2)
-                    ))
-                    
-                    # Threshold line
-                    fig.add_trace(go.Scatter(
-                        x=timestamps, y=[final_threshold] * len(timestamps),
-                        name='Threshold',
-                        line=dict(color='red', dash='dash', width=2)
-                    ))
-                    
-                    # Blink markers
-                    if blinks:
-                        blink_times = [timestamps[b[0]] for b in blinks]
-                        blink_values = [openness_smoothed[b[0]] for b in blinks]
-                        
-                        fig.add_trace(go.Scatter(
-                            x=blink_times, y=blink_values,
-                            mode='markers',
-                            name='Blinks',
-                            marker=dict(color='red', size=10, symbol='x', line=dict(width=2))
-                        ))
-                    
-                    fig.update_layout(
-                        title="VR Eye Openness Signal with Blink Detection",
-                        xaxis_title="Time (seconds)",
-                        yaxis_title="Eye Openness Score",
-                        height=500,
-                        showlegend=True
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Signal statistics
-                    st.subheader("Signal Statistics")
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("Mean", f"{np.mean(openness_smoothed):.3f}")
-                    col2.metric("Std Dev", f"{np.std(openness_smoothed):.3f}")
-                    col3.metric("Dynamic Range", f"{np.ptp(openness_smoothed):.3f}")
-                    col4.metric("Blinks/Min", f"{blink_rate:.1f}")
-                
-                with tab2:
-                    if blinks:
-                        st.subheader("Blink Events Timeline")
-                        
-                        # Create timeline data
-                        blink_data = []
-                        for i, blink in enumerate(blinks):
-                            blink_time = timestamps[blink[0]]
-                            blink_data.append({
-                                'Blink #': i + 1,
-                                'Time (s)': f"{blink_time:.2f}",
-                                'Openness': f"{openness_smoothed[blink[0]]:.3f}",
-                                'Frame': blink[0]
-                            })
-                        
-                        # Display as dataframe
-                        df = pd.DataFrame(blink_data)
-                        st.dataframe(df, use_container_width=True)
-                        
-                        # Blink intervals analysis
-                        if len(blinks) > 1:
-                            intervals = []
-                            for i in range(1, len(blinks)):
-                                interval = timestamps[blinks[i][0]] - timestamps[blinks[i-1][0]]
-                                intervals.append(interval)
-                            
-                            st.subheader("Blink Interval Analysis")
-                            col1, col2, col3 = st.columns(3)
-                            col1.metric("Avg Interval", f"{np.mean(intervals):.2f}s")
-                            col2.metric("Min Interval", f"{np.min(intervals):.2f}s")
-                            col3.metric("Max Interval", f"{np.max(intervals):.2f}s")
-                    
-                    else:
-                        st.info("No blinks detected. Try adjusting the threshold or check video quality.")
-                
-                with tab3:
-                    if processed_frames:
-                        st.subheader("VR Frame Analysis Preview")
-                        st.info("Green: Eye detection area | Blue: Eyelid region")
-                        
-                        cols = st.columns(min(3, len(processed_frames)))
-                        for idx, (frame, openness, is_blink) in enumerate(processed_frames[:3]):
-                            with cols[idx]:
-                                st.image(Image.fromarray(frame),
-                                       caption=f"Openness: {openness:.3f} {'🔴 BLINK' if is_blink else '⚪ OPEN'}",
-                                       use_column_width=True)
-                
-                # Export results
-                st.subheader("📥 Export VR Analysis Results")
-                results_text = f"""VR EYE BLINK ANALYSIS RESULTS
-================================
-Video: {uploaded_file.name}
-Total Blinks: {total_blinks}
-Blink Rate: {blink_rate:.1f} blinks/minute
-Video Duration: {duration:.2f} seconds
-VR Threshold: {final_threshold:.3f}
-Frames Analyzed: {len(openness_values)}
-Analysis Mode: {'Auto VR' if auto_mode == 'Auto VR' else 'Manual'}
 
-DETECTED BLINKS:
-Time(s)    Openness
-"""
-                for blink in blinks:
-                    results_text += f"{timestamps[blink[0]]:7.2f}    {openness_smoothed[blink[0]]:.3f}\n"
-                
-                st.download_button(
-                    "💾 Download Full Analysis",
-                    results_text,
-                    file_name=f"vr_blink_analysis_{uploaded_file.name.split('.')[0]}.txt",
-                    mime="text/plain"
-                )
-                
-        except Exception as e:
-            st.error(f"Processing error: {str(e)}")
-            st.info("""
-            **VR-Specific Troubleshooting:**
-            - Ensure eye is clearly visible in the video
-            - Try shorter videos (10-30 seconds)
-            - Adjust threshold manually if auto-mode doesn't work
-            - Check lighting consistency in VR footage
-            """)
-        
-        finally:
-            if os.path.exists(video_path):
-                os.unlink(video_path)
-    
+# ---------------------------------------------------------
+# ----------- MINUTE-BY-MINUTE ANALYSIS -------------------
+# ---------------------------------------------------------
+def analyze_video(
+    video_path,
+    roi_mode,
+    roi_offset_x,
+    roi_offset_y,
+    sample_fps,
+    smoothing_sigma,
+    min_blink_samples,
+    threshold_method,
+    threshold_param,
+    auto_invert,
+    max_minutes,
+    progress_callback
+):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open rotated video")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = total_frames / fps
+    total_minutes = math.ceil(duration / 60)
+
+    if max_minutes and max_minutes > 0:
+        total_minutes = min(total_minutes, max_minutes)
+
+    # read first frame to set ROI
+    ret, frame0 = cap.read()
+    if not ret:
+        cap.release()
+        raise RuntimeError("Could not read first frame")
+    h, w = frame0.shape[:2]
+
+    roi_w = int(w * 0.5)
+    roi_h = int(h * 0.6)
+
+    if roi_mode == "left":
+        roi_x = int(w * roi_offset_x)
+    elif roi_mode == "right":
+        roi_x = max(0, w - roi_w - int(w * roi_offset_x))
     else:
-        st.markdown("""
-        ### 🎯 VR-Specific Features:
-        
-        **Optimized for Side-Camera Footage:**
-        - 🤖 **Auto VR-threshold** - specifically tuned for angled views
-        - 👁️ **Eyelid-focused analysis** - better for partial visibility
-        - 🎯 **VR region detection** - optimized for side-camera positioning
-        - 📊 **Adaptive algorithms** - adjust to VR lighting conditions
-        
-        **Expected VR Signal Characteristics:**
-        - Open eye: 0.4-0.7 range
-        - Closed eye: 0.15-0.3 range  
-        - Typical threshold: 0.18-0.28
-        
-        **Upload Tips:**
-        - Short videos work best (10-30 seconds)
-        - Ensure consistent lighting
-        - Eye should be visible in left portion of frame
-        - Use MP4 or WEBM format
-        """)
+        roi_x = int((w - roi_w) // 2 + w * roi_offset_x)
+
+    roi_y = int((h - roi_h) // 2 + h * roi_offset_y)
+
+    roi_x = max(0, min(roi_x, w - roi_w))
+    roi_y = max(0, min(roi_y, h - roi_h))
+
+    sample_step = max(1, int(round(fps / sample_fps)))
+
+    # detect signal polarity using first ~5 seconds
+    polarity = 1.0
+    if auto_invert:
+        quick_vals = []
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        idx = 0
+        needed = max(10, int(5 * sample_fps))
+
+        while len(quick_vals) < needed:
+            ret, fr = cap.read()
+            if not ret:
+                break
+            if idx % sample_step == 0:
+                gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+                roi = gray[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+                d = detect_pupil(roi)
+                if d is not None:
+                    quick_vals.append(d)
+            idx += 1
+
+        if len(quick_vals) > 5:
+            q = np.array(quick_vals)
+            # Heuristic: if mean>median -> dips represent blinks → invert
+            if np.mean(q) > np.median(q):
+                polarity = -1.0
+
+    results = []
+
+    # process minute-by-minute
+    for minute in range(total_minutes):
+        start_s = minute * 60
+        start_f = int(start_s * fps)
+        end_f = int(min((minute + 1) * 60 * fps, total_frames))
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
+
+        metrics = []
+        timestamps = []
+        fi = start_f
+
+        while fi < end_f:
+            ret, fr = cap.read()
+            if not ret:
+                break
+
+            if (fi - start_f) % sample_step == 0:
+                gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+                roi = gray[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+
+                d = detect_pupil(roi)
+                metrics.append(d if d is not None else np.nan)
+                timestamps.append(fi / fps)
+
+            fi += 1
+
+        vals = np.array(metrics, dtype=float)
+
+        # interpolate NaNs
+        if np.all(np.isnan(vals)):
+            vals[:] = 0
+        else:
+            nans = np.isnan(vals)
+            if np.any(nans):
+                good = np.where(~nans)[0]
+                vals[nans] = np.interp(np.where(nans)[0], good, vals[good])
+
+        closure_raw = -polarity * vals
+
+        if closure_raw.max() - closure_raw.min() > 1e-6:
+            norm = (closure_raw - closure_raw.min()) / (closure_raw.max() - closure_raw.min())
+        else:
+            norm = np.zeros_like(closure_raw)
+
+        smoothed = gaussian_filter1d(norm, sigma=smoothing_sigma) if len(norm) > 1 else norm
+
+        # threshold
+        if threshold_method == "percentile":
+            thr = np.percentile(smoothed, threshold_param)
+        elif threshold_method == "median_std":
+            thr = np.median(smoothed) + threshold_param * np.std(smoothed)
+        else:
+            try:
+                hist, bins = np.histogram(smoothed, bins=64)
+                total = hist.sum()
+                sum_total = (bins[:-1] * hist).sum()
+                weight_b = 0
+                sum_b = 0
+                max_var = 0
+                thresh = bins[0]
+                for i in range(len(hist)):
+                    weight_b += hist[i]
+                    if weight_b == 0:
+                        continue
+                    weight_f = total - weight_b
+                    if weight_f == 0:
+                        break
+                    sum_b += bins[i] * hist[i]
+                    mean_b = sum_b / weight_b
+                    mean_f = (sum_total - sum_b) / weight_f
+                    var = weight_b * weight_f * (mean_b - mean_f)**2
+                    if var > max_var:
+                        max_var = var
+                        thresh = bins[i]
+                thr = thresh
+            except:
+                thr = np.percentile(smoothed, 90)
+
+        min_dist = max(1, int(0.2 * sample_fps))
+        peaks, _ = find_peaks(smoothed, height=thr, distance=min_dist)
+
+        blink_times = [timestamps[p] for p in peaks]
+
+        results.append({
+            "minute": minute,
+            "timestamps": timestamps,
+            "signal": smoothed.tolist(),
+            "threshold": float(thr),
+            "blinks": blink_times,
+            "blink_count": len(blink_times)
+        })
+
+        progress_callback(minute + 1, total_minutes)
+
+    cap.release()
+
+    return results, {"fps": fps, "duration": duration, "frames": total_frames}
+
+
+# ---------------------------------------------------------
+# ---------------------- STREAMLIT UI ----------------------
+# ---------------------------------------------------------
+def main():
+    st.title("👁️ Pupil & Blink Analyzer — GC0308 (with rotation)")
+
+    uploaded = st.file_uploader("Upload video", type=["mp4", "mov", "avi", "mkv"])
+    if not uploaded:
+        st.info("Upload video to start.")
+        return
+
+    with st.expander("Video rotation", expanded=True):
+        rotation = st.selectbox(
+            "Select rotation",
+            ["none", "90cw", "90ccw", "180"],
+            format_func=lambda x: {
+                "none": "No rotation",
+                "90cw": "Rotate 90° clockwise",
+                "90ccw": "Rotate 90° counter-clockwise",
+                "180": "Rotate 180°"
+            }[x]
+        )
+
+    with st.expander("Analysis settings", expanded=True):
+        roi_mode = st.selectbox("ROI mode", ["left", "right", "auto"])
+        roi_offset_x = st.slider("ROI offset X", -0.2, 0.2, 0.05, 0.01)
+        roi_offset_y = st.slider("ROI offset Y", -0.2, 0.2, 0.0, 0.01)
+        sample_fps = st.slider("Sample FPS", 4, 30, 10)
+        smoothing_sigma = st.slider("Smoothing sigma", 0, 6, 2)
+        min_blink_samples = st.slider("Min blink samples", 1, 6, 2)
+        threshold_method = st.selectbox("Threshold method", ["percentile", "median_std", "otsu"])
+        threshold_param = st.slider("Threshold parameter", 50, 99, 90) if threshold_method == "percentile" else \
+                          st.slider("k", 0.1, 3.0, 1.2)
+        auto_invert = st.checkbox("Auto-detect signal polarity", True)
+        max_minutes = st.number_input("Max minutes (0 = full video)", min_value=0, value=0)
+
+    # Save upload to temp
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(uploaded.read())
+        input_path = tmp.name
+
+    # ROTATE FIRST
+    st.write("Rotating video…")
+    rotated_path = rotate_video_to_temp(input_path, rotation)
+    st.success("Rotation done.")
+
+    if st.button("Start analysis"):
+        progress_text = st.empty()
+        progress_bar = st.progress(0)
+
+        def callback(done, total):
+            progress_bar.progress(int(done / total * 100))
+            progress_text.text(f"Processing minute {done}/{total}")
+
+        results, meta = analyze_video(
+            rotated_path,
+            roi_mode, roi_offset_x, roi_offset_y,
+            sample_fps,
+            smoothing_sigma,
+            min_blink_samples,
+            threshold_method,
+            threshold_param,
+            auto_invert,
+            max_minutes,
+            callback
+        )
+
+        st.success("Analysis complete.")
+
+        # SUMMARY TABLE
+        st.subheader("Per-minute blink counts")
+        mins = [r["minute"] for r in results]
+        counts = [r["blink_count"] for r in results]
+        st.table({"minute": mins, "blinks": counts})
+
+        # GRAPH BLINK RATE
+        fig_rate = go.Figure()
+        fig_rate.add_trace(go.Bar(x=mins, y=counts))
+        fig_rate.update_layout(title="Blink count per minute", xaxis_title="Minute", yaxis_title="Blinks/min")
+        st.plotly_chart(fig_rate, use_container_width=True)
+
+        # Detailed minute-by-minute plots
+        st.subheader("Minute details")
+        for r in results:
+            with st.expander(f"Minute {r['minute']} (blinks: {r['blink_count']})", expanded=False):
+                ts = r["timestamps"]
+                sig = r["signal"]
+                thr = r["threshold"]
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=ts, y=sig, mode="lines", name="signal"))
+                fig.add_trace(go.Scatter(x=[ts[0], ts[-1]], y=[thr, thr], mode="lines",
+                                         name="threshold", line=dict(color="red", dash="dash")))
+
+                # Mark blinks
+                if r["blinks"]:
+                    blink_vals = [sig[np.argmin(np.abs(np.array(ts) - t))] for t in r["blinks"]]
+                    fig.add_trace(go.Scatter(x=r["blinks"], y=blink_vals,
+                                             mode="markers", name="blinks",
+                                             marker=dict(color="red", symbol="x", size=10)))
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                # CSV download
+                csv_buf = "timestamp,signal\n"
+                for t, s in zip(ts, sig):
+                    csv_buf += f"{t:.3f},{s:.6f}\n"
+                st.download_button(
+                    f"Download minute {r['minute']} CSV",
+                    csv_buf,
+                    file_name=f"minute_{r['minute']:03d}.csv",
+                    mime="text/csv"
+                )
+
+        # ZIP export
+        zip_bytes = BytesIO()
+        with zipfile.ZipFile(zip_bytes, "w", zipfile.ZIP_DEFLATED) as z:
+            for r in results:
+                csv_buf = "timestamp,signal\n"
+                for t, s in zip(r["timestamps"], r["signal"]):
+                    csv_buf += f"{t:.3f},{s:.6f}\n"
+                z.writestr(f"minute_{r['minute']:03d}.csv", csv_buf)
+
+            summary = "minute,blinks\n"
+            for r in results:
+                summary += f"{r['minute']},{r['blink_count']}\n"
+            z.writestr("summary.csv", summary)
+
+        st.download_button("Download all results (ZIP)",
+                           zip_bytes.getvalue(),
+                           file_name="analysis.zip",
+                           mime="application/zip")
+
+
+    # Cleanup
+    if os.path.exists(input_path):
+        os.unlink(input_path)
+    if rotated_path != input_path and os.path.exists(rotated_path):
+        os.unlink(rotated_path)
+
 
 if __name__ == "__main__":
     main()
